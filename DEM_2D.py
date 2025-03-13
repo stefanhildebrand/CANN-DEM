@@ -1,0 +1,594 @@
+# This file contains the class "DeepEnergyMethod" which is the main class for the DEM
+# The DEM is trained in the method "train_model" and evaluated in the method "evaluate_model"
+# The DEM is trained by minimizing the loss function "loss" which is the sum of the energy derived from the
+# density psi from the CANN and the derivation from the BCs
+
+# copied the base from DeepEnergyMethod.dem_hyperelasticity.Beam_2D.Beam2D_4x1_NeoHook_Trap
+
+# the energy argument is originally an "EnergyModel" and changed use the CANN model
+# "getStoredEnergy" is a method from the class "EnergyModel" that actually gets the energy density
+# "getStoredEnergy" now needs to come from the CANN model instead
+
+# the optimizer needs to be changed to a torchopt optimizer to be able to differentiate through the opimization step
+
+from pathlib import Path
+
+import torch
+import torchopt
+
+from CANN_2D import CANN_2D
+from utils import compute_F
+from DeepEnergyMethod.dem_hyperelasticity import EnergyModel as md
+from DeepEnergyMethod.dem_hyperelasticity.Beam2D import config as cf
+from DeepEnergyMethod.dem_hyperelasticity.Beam2D import define_structure as des
+from DeepEnergyMethod.dem_hyperelasticity.IntegrationLoss import IntegrationLoss
+from DeepEnergyMethod.dem_hyperelasticity.MultiLayerNet import MultiLayerNet
+
+# from DEM.visualization.plot_beam import plot_beam
+torch.autograd.set_detect_anomaly(False)
+
+from DeepEnergyMethod.dem_hyperelasticity.config import *
+
+#dev = torch.device('cpu')
+#device = torch.device('cuda')
+
+class DeepEnergyMethod:
+    # Instance attributes
+    def __init__(self, model, numIntType, energy, dim, learning_rate, device, model_type='original', optimizer=torch.optim.Adam):
+        # self.data = data
+        self.model = MultiLayerNet(model[0], model[1], model[2])
+        self.model = self.model.to(device)
+        self.intLoss = IntegrationLoss(numIntType, dim)
+        self.energy = energy
+        self.dim = dim
+        self.model_type = model_type
+
+        # if optimizer name contains "torchopt"
+        if 'torchopt' in str(optimizer):
+            self.optimizer = optimizer(self.model, lr=learning_rate)
+        else:
+            self.optimizer = optimizer(self.model.parameters(), lr=learning_rate, differentiable=True)
+
+    def train_model(self, shape, dxdydz, data, neumannBC, dirichletBC, iteration, convergence_criterion=1e-8, compression_factor=50):
+
+        inplace_test = True
+
+        ### Jonathan ### 
+        # data should be tensor already
+
+        x = data
+
+        # x = torch.from_numpy(data).float()
+        # x = x.to(dev)
+        # x.requires_grad_(True)
+        ################
+
+        # get tensor inputs and outputs for boundary conditions
+        # -------------------------------------------------------------------------------
+        #                             Dirichlet BC
+        # -------------------------------------------------------------------------------
+        dirBC_coordinates = {}  # declare a dictionary
+        dirBC_values = {}  # declare a dictionary
+        dirBC_penalty = {}
+        for i, keyi in enumerate(dirichletBC):
+            dirBC_coordinates[i] = torch.from_numpy(dirichletBC[keyi]['coord']).float().to(device)
+            dirBC_values[i] = torch.from_numpy(dirichletBC[keyi]['known_value']).float().to(device)
+            dirBC_penalty[i] = torch.tensor(dirichletBC[keyi]['penalty']).float().to(device)
+        # -------------------------------------------------------------------------------
+        #                           Neumann BC
+        # -------------------------------------------------------------------------------
+        neuBC_coordinates = {}  # declare a dictionary
+        neuBC_values = {}  # declare a dictionary
+        neuBC_penalty = {}
+        for i, keyi in enumerate(neumannBC):
+            neuBC_coordinates[i] = torch.from_numpy(neumannBC[keyi]['coord']).float().to(device)
+            neuBC_coordinates[i].requires_grad_(True)
+            neuBC_values[i] = torch.from_numpy(neumannBC[keyi]['known_value']).float().to(device)
+            neuBC_penalty[i] = torch.tensor(neumannBC[keyi]['penalty']).float().to(device)
+        # ----------------------------------------------------------------------------------
+        # Minimizing loss function (energy and boundary conditions)
+        # ----------------------------------------------------------------------------------
+
+        ### Jonathan ###
+        #optimizer = torch.optim.LBFGS(self.model.parameters(), lr=learning_rate, max_iter=20)
+
+        ################
+
+        start_time = time.time()
+        energy_loss_array = []
+        internal_loss_array = []
+        external_loss_array = []
+        boundary_loss_array = []
+        loss_array = []
+        for t in range(iteration):
+            # Zero gradients, perform a backward pass, and update the weights.
+
+            #########################################################
+            # removed closure() definition and replaced with code from closure()
+            #########################################################
+            
+            #optimizer.step(closure)
+
+            ### Jonathan ###            
+
+            it_time = time.time()
+            u_pred = self.getU(x)
+
+            if self.model_type == 'original':
+                storedEnergy = self.energy.getStoredEnergy(u_pred, x)
+
+            elif self.model_type == 'CANN':
+                F = compute_F(x, u_pred, grid_shape=(cf.Nx, cf.Ny))
+                storedEnergy = self.energy(F)
+            internal2 = self.intLoss.lossInternalEnergy(storedEnergy, dx=dxdydz[0], dy=dxdydz[1], shape=shape)
+            external2 = torch.zeros(len(neuBC_coordinates))
+            for i, vali in enumerate(neuBC_coordinates):
+                neu_u_pred = self.getU(neuBC_coordinates[i])
+                fext = torch.bmm((neu_u_pred + neuBC_coordinates[i]).unsqueeze(1), neuBC_values[i].unsqueeze(2))
+                external2[i] = self.intLoss.lossExternalEnergy(fext, dx=dxdydz[1])
+            bc_u_crit = torch.zeros((len(dirBC_coordinates)))
+            for i, vali in enumerate(dirBC_coordinates):
+                dir_u_pred = self.getU(dirBC_coordinates[i])
+                bc_u_crit[i] = self.loss_squared_sum(dir_u_pred, dirBC_values[i])
+            energy_loss = internal2 - torch.sum(external2)
+            boundary_loss = torch.sum(bc_u_crit)
+            #loss = internal2 - torch.sum(external2) + boundary_loss
+
+            ### Jonathan ###
+            detF = torch.det(F)
+            compression_loss = torch.where(detF < 1, ((1 / detF) - 1), (detF-1)).pow(2).mean()
+            loss = internal2 - torch.sum(external2) + boundary_loss + compression_loss*compression_factor
+
+            # if optimizer name contains "torchopt"
+            if 'torchopt' in str(self.optimizer):
+                self.optimizer.step(loss=loss)
+            else:
+                self.optimizer.zero_grad()
+                loss.backward(retain_graph=True)
+                self.optimizer.step()
+
+            if t % 10 == 0:
+                print('Iter: %d Loss: %.6e Energy: %.6e Boundary: %.6e Compression: %.6e Time: %.3e'
+                        % (t + 1, loss.item(), energy_loss.item(), boundary_loss.item(), compression_loss.item(), time.time() - it_time))
+            energy_loss_array.append(energy_loss.data)
+            boundary_loss_array.append(boundary_loss.data)
+            loss_array.append(loss.data.item())
+
+            #############
+            ### Jonathan ###
+
+            internal_loss_array.append(internal2.data.item())
+            external_loss_array.append(torch.sum(external2).data.item()) 
+
+            # break out of loop when loss converges
+            end_length = 5
+            if len(loss_array) >= end_length:
+                loss_array_end = loss_array[-end_length:]
+                loss_array_end_diff = max(loss_array_end) - min(loss_array_end)
+                if (loss_array_end_diff < convergence_criterion * 50) and (loss_array[-1] < loss_array[-2]): #max(np.abs(internal_loss_array + external_loss_array)):
+                    print('Loss converged')
+                    break
+            ################
+            ################
+        elapsed = time.time() - start_time
+        print('Training time: %.4f' % elapsed)
+
+        if self.model_type == 'CANN':
+
+            saved_state = {
+                'model_state_dict': self.model.state_dict(),
+                #'optimizer_hyperparams': {param: self.optimizer.defaults[param] for param in ('lr', 'betas', 'eps', 'weight_decay')}
+            }
+
+            return storedEnergy, F, saved_state, loss_array
+
+    def getU(self, x):
+        u = self.model(x)
+        Ux = x[:, 0] * u[:, 0]
+        Uy = x[:, 0] * u[:, 1]
+        Ux = Ux.reshape(Ux.shape[0], 1)
+        Uy = Uy.reshape(Uy.shape[0], 1)
+        u_pred = torch.cat((Ux, Uy), -1)
+        return u_pred
+
+    # --------------------------------------------------------------------------------
+    # Evaluate model to obtain:
+    # 1. U - Displacement
+    # 2. E - Green Lagrange Strain
+    # 3. S - 2nd Piola Kirchhoff Stress
+    # 4. F - Deformation Gradient
+    # Date implement: 20.06.2019
+    # --------------------------------------------------------------------------------
+    def evaluate_model(self, x, y, z, device):
+        #energy_type = self.energy.type
+
+        ### Jonathan ###
+        # hard coded for now
+        energy_type = 'neohookean'
+        #mu = self.energy.mu
+        #lmbda = self.energy.lam
+        E = cf.E
+        nu = cf.nu
+        mu = E / (2 * (1 + nu))
+        lmbda = (E * nu) / ((1 + nu) * (1 - 2 * nu))
+        ################
+
+        dim = self.dim
+        if dim == 2:
+            Nx = len(x)
+            Ny = len(y)
+
+            xGrid, yGrid = np.meshgrid(x, y)
+            x1D = xGrid.flatten()
+            y1D = yGrid.flatten()
+            xy = np.concatenate((np.array([x1D]).T, np.array([y1D]).T), axis=-1)
+            xy_tensor = torch.from_numpy(xy).float()
+            xy_tensor = xy_tensor.to(device)
+            xy_tensor.requires_grad_(True)
+            # u_pred_torch = self.model(xy_tensor)
+            u_pred_torch = self.getU(xy_tensor)
+            duxdxy = grad(u_pred_torch[:, 0].unsqueeze(1), xy_tensor, torch.ones(xy_tensor.size()[0], 1, device=device),
+                           create_graph=True, retain_graph=True)[0]
+            duydxy = grad(u_pred_torch[:, 1].unsqueeze(1), xy_tensor, torch.ones(xy_tensor.size()[0], 1, device=device),
+                           create_graph=True, retain_graph=True)[0]
+            F11 = duxdxy[:, 0].unsqueeze(1) + 1
+            F12 = duxdxy[:, 1].unsqueeze(1) + 0
+            F21 = duydxy[:, 0].unsqueeze(1) + 0
+            F22 = duydxy[:, 1].unsqueeze(1) + 1
+            detF = F11 * F22 - F12 * F21
+            invF11 = F22 / detF
+            invF22 = F11 / detF
+            invF12 = -F12 / detF
+            invF21 = -F21 / detF
+            C11 = F11**2 + F21**2
+            C12 = F11*F12 + F21*F22
+            C21 = F12*F11 + F22*F21
+            C22 = F12**2 + F22**2
+            E11 = 0.5 * (C11 - 1)
+            E12 = 0.5 * C12
+            E21 = 0.5 * C21
+            E22 = 0.5 * (C22 - 1)
+            if energy_type == 'neohookean' and dim == 2:
+                P11 = mu * F11 + (lmbda * torch.log(detF) - mu) * invF11
+                P12 = mu * F12 + (lmbda * torch.log(detF) - mu) * invF21
+                P21 = mu * F21 + (lmbda * torch.log(detF) - mu) * invF12
+                P22 = mu * F22 + (lmbda * torch.log(detF) - mu) * invF22
+            else:
+                print("This energy model will be implemented later !!!")
+                exit()
+            S11 = invF11 * P11 + invF12 * P21
+            S12 = invF11 * P12 + invF12 * P22
+            S21 = invF21 * P11 + invF22 * P21
+            S22 = invF21 * P12 + invF22 * P22
+            u_pred = u_pred_torch.detach().cpu().numpy()
+            F11_pred = F11.detach().cpu().numpy()
+            F12_pred = F12.detach().cpu().numpy()
+            F21_pred = F21.detach().cpu().numpy()
+            F22_pred = F22.detach().cpu().numpy()
+            E11_pred = E11.detach().cpu().numpy()
+            E12_pred = E12.detach().cpu().numpy()
+            E21_pred = E21.detach().cpu().numpy()
+            E22_pred = E22.detach().cpu().numpy()
+            S11_pred = S11.detach().cpu().numpy()
+            S12_pred = S12.detach().cpu().numpy()
+            S21_pred = S21.detach().cpu().numpy()
+            S22_pred = S22.detach().cpu().numpy()
+            surUx = u_pred[:, 0].reshape(Ny, Nx, 1)
+            surUy = u_pred[:, 1].reshape(Ny, Nx, 1)
+            surUz = np.zeros([Nx, Ny, 1])
+            surE11 = E11_pred.reshape(Ny, Nx, 1)
+            surE12 = E12_pred.reshape(Ny, Nx, 1)
+            surE13 = np.zeros([Nx, Ny, 1])
+            surE21 = E21_pred.reshape(Ny, Nx, 1)
+            surE22 = E22_pred.reshape(Ny, Nx, 1)
+            surE23 = np.zeros([Nx, Ny, 1])
+            surE33 = np.zeros([Nx, Ny, 1])
+            surS11 = S11_pred.reshape(Ny, Nx, 1)
+            surS12 = S12_pred.reshape(Ny, Nx, 1)
+            surS13 = np.zeros([Nx, Ny, 1])
+            surS21 = S21_pred.reshape(Ny, Nx, 1)
+            surS22 = S22_pred.reshape(Ny, Nx, 1)
+            surS23 = np.zeros([Nx, Ny, 1])
+            surS33 = np.zeros([Nx, Ny, 1])
+            SVonMises = np.float64(np.sqrt(0.5 * ((surS11 - surS22) ** 2 + (surS22) ** 2 + (-surS11) ** 2 + 6 * (surS12 ** 2))))
+            U = (np.float64(surUx), np.float64(surUy), np.float64(surUz))
+
+            ### Jonathan ###
+            
+            F1 = torch.cat((F11, F12), dim=1)
+            F2 = torch.cat((F21, F22), dim=1)            
+            F = torch.cat((F1.unsqueeze(-1),F2.unsqueeze(-1)),dim=2).transpose(1,2)
+
+            ################
+
+            return U, np.float64(surS11), np.float64(surS12), np.float64(surS13), np.float64(surS22), np.float64(
+                surS23), \
+                   np.float64(surS33), np.float64(surE11), np.float64(surE12), \
+                   np.float64(surE13), np.float64(surE22), np.float64(surE23), np.float64(surE33), np.float64(
+                SVonMises), \
+                   np.float64(F11_pred), np.float64(F12_pred), np.float64(F21_pred), np.float64(F22_pred), \
+                   F, xy_tensor # Jonathan
+        else:
+            Nx = len(x)
+            Ny = len(y)
+            Nz = len(z)
+            xGrid, yGrid, zGrid = np.meshgrid(x, y, z)
+            x1D = xGrid.flatten()
+            y1D = yGrid.flatten()
+            z1D = zGrid.flatten()
+            xyz = np.concatenate((np.array([x1D]).T, np.array([y1D]).T, np.array([z1D]).T), axis=-1)
+            xyz_tensor = torch.from_numpy(xyz).float()
+            xyz_tensor = xyz_tensor.to(device)
+            xyz_tensor.requires_grad_(True)
+            # u_pred_torch = self.model(xyz_tensor)
+            u_pred_torch = self.getU(xyz_tensor)
+            duxdxyz = grad(u_pred_torch[:, 0].unsqueeze(1), xyz_tensor, torch.ones(xyz_tensor.size()[0], 1, device=device),
+                           create_graph=True, retain_graph=True)[0]
+            duydxyz = grad(u_pred_torch[:, 1].unsqueeze(1), xyz_tensor, torch.ones(xyz_tensor.size()[0], 1, device=device),
+                           create_graph=True, retain_graph=True)[0]
+            duzdxyz = grad(u_pred_torch[:, 2].unsqueeze(1), xyz_tensor, torch.ones(xyz_tensor.size()[0], 1, device=device),
+                           create_graph=True, retain_graph=True)[0]
+            F11 = duxdxyz[:, 0].unsqueeze(1) + 1
+            F12 = duxdxyz[:, 1].unsqueeze(1) + 0
+            F13 = duxdxyz[:, 2].unsqueeze(1) + 0
+            F21 = duydxyz[:, 0].unsqueeze(1) + 0
+            F22 = duydxyz[:, 1].unsqueeze(1) + 1
+            F23 = duydxyz[:, 2].unsqueeze(1) + 0
+            F31 = duzdxyz[:, 0].unsqueeze(1) + 0
+            F32 = duzdxyz[:, 1].unsqueeze(1) + 0
+            F33 = duzdxyz[:, 2].unsqueeze(1) + 1
+            detF = F11 * (F22 * F33 - F23 * F32) - F12 * (F21 * F33 - F23 * F31) + F13 * (F21 * F32 - F22 * F31)
+            invF11 = (F22 * F33 - F23 * F32) / detF
+            invF12 = -(F12 * F33 - F13 * F32) / detF
+            invF13 = (F12 * F23 - F13 * F22) / detF
+            invF21 = -(F21 * F33 - F23 * F31) / detF
+            invF22 = (F11 * F33 - F13 * F31) / detF
+            invF23 = -(F11 * F23 - F13 * F21) / detF
+            invF31 = (F21 * F32 - F22 * F31) / detF
+            invF32 = -(F11 * F32 - F12 * F31) / detF
+            invF33 = (F11 * F22 - F12 * F21) / detF
+            C11 = F11 ** 2 + F21 ** 2 + F31 ** 2
+            C12 = F11 * F12 + F21 * F22 + F31 * F32
+            C13 = F11 * F13 + F21 * F23 + F31 * F33
+            C21 = F12 * F11 + F22 * F21 + F32 * F31
+            C22 = F12 ** 2 + F22 ** 2 + F32 ** 2
+            C23 = F12 * F13 + F22 * F23 + F32 * F33
+            C31 = F13 * F11 + F23 * F21 + F33 * F31
+            C32 = F13 * F12 + F23 * F22 + F33 * F32
+            C33 = F13 ** 2 + F23 ** 2 + F33 ** 2
+            E11 = 0.5 * (C11 - 1)
+            E12 = 0.5 * C12
+            E13 = 0.5 * C13
+            E21 = 0.5 * C21
+            E22 = 0.5 * (C22 - 1)
+            E23 = 0.5 * C23
+            E31 = 0.5 * C31
+            E32 = 0.5 * C32
+            E33 = 0.5 * (C33 - 1)
+            if energy_type == 'neohookean' and dim == 3:
+                P11 = mu * F11 + (lmbda * torch.log(detF) - mu) * invF11
+                P12 = mu * F12 + (lmbda * torch.log(detF) - mu) * invF21
+                P13 = mu * F13 + (lmbda * torch.log(detF) - mu) * invF31
+                P21 = mu * F21 + (lmbda * torch.log(detF) - mu) * invF12
+                P22 = mu * F22 + (lmbda * torch.log(detF) - mu) * invF22
+                P23 = mu * F23 + (lmbda * torch.log(detF) - mu) * invF32
+                P31 = mu * F31 + (lmbda * torch.log(detF) - mu) * invF13
+                P32 = mu * F32 + (lmbda * torch.log(detF) - mu) * invF23
+                P33 = mu * F33 + (lmbda * torch.log(detF) - mu) * invF33
+            else:
+                print("This energy model will be implemented later !!!")
+                exit()
+            S11 = invF11 * P11 + invF12 * P21 + invF13 * P31
+            S12 = invF11 * P12 + invF12 * P22 + invF13 * P32
+            S13 = invF11 * P13 + invF12 * P23 + invF13 * P33
+            S21 = invF21 * P11 + invF22 * P21 + invF23 * P31
+            S22 = invF21 * P12 + invF22 * P22 + invF23 * P32
+            S23 = invF21 * P13 + invF22 * P23 + invF23 * P33
+            S31 = invF31 * P11 + invF32 * P21 + invF33 * P31
+            S32 = invF31 * P12 + invF32 * P22 + invF33 * P32
+            S33 = invF31 * P13 + invF32 * P23 + invF33 * P33
+            u_pred = u_pred_torch.detach().cpu().numpy()
+            F11_pred = F11.detach().cpu().numpy()
+            F12_pred = F12.detach().cpu().numpy()
+            F13_pred = F13.detach().cpu().numpy()
+            F21_pred = F21.detach().cpu().numpy()
+            F22_pred = F22.detach().cpu().numpy()
+            F23_pred = F23.detach().cpu().numpy()
+            F31_pred = F31.detach().cpu().numpy()
+            F32_pred = F32.detach().cpu().numpy()
+            F33_pred = F33.detach().cpu().numpy()
+            E11_pred = E11.detach().cpu().numpy()
+            E12_pred = E12.detach().cpu().numpy()
+            E13_pred = E13.detach().cpu().numpy()
+            E21_pred = E21.detach().cpu().numpy()
+            E22_pred = E22.detach().cpu().numpy()
+            E23_pred = E23.detach().cpu().numpy()
+            E31_pred = E31.detach().cpu().numpy()
+            E32_pred = E32.detach().cpu().numpy()
+            E33_pred = E33.detach().cpu().numpy()
+            S11_pred = S11.detach().cpu().numpy()
+            S12_pred = S12.detach().cpu().numpy()
+            S13_pred = S13.detach().cpu().numpy()
+            S21_pred = S21.detach().cpu().numpy()
+            S22_pred = S22.detach().cpu().numpy()
+            S23_pred = S23.detach().cpu().numpy()
+            S31_pred = S31.detach().cpu().numpy()
+            S32_pred = S32.detach().cpu().numpy()
+            S33_pred = S33.detach().cpu().numpy()
+            surUx = u_pred[:, 0].reshape(Ny, Nx, Nz)
+            surUy = u_pred[:, 1].reshape(Ny, Nx, Nz)
+            surUz = u_pred[:, 2].reshape(Ny, Nx, Nz)
+            surE11 = E11_pred.reshape(Ny, Nx, Nz)
+            surE12 = E12_pred.reshape(Ny, Nx, Nz)
+            surE13 = E13_pred.reshape(Ny, Nx, Nz)
+            surE21 = E21_pred.reshape(Ny, Nx, Nz)
+            surE22 = E22_pred.reshape(Ny, Nx, Nz)
+            surE23 = E23_pred.reshape(Ny, Nx, Nz)
+            surE31 = E31_pred.reshape(Ny, Nx, Nz)
+            surE32 = E32_pred.reshape(Ny, Nx, Nz)
+            surE33 = E33_pred.reshape(Ny, Nx, Nz)
+            surS11 = S11_pred.reshape(Ny, Nx, Nz)
+            surS12 = S12_pred.reshape(Ny, Nx, Nz)
+            surS13 = S13_pred.reshape(Ny, Nx, Nz)
+            surS21 = S21_pred.reshape(Ny, Nx, Nz)
+            surS22 = S22_pred.reshape(Ny, Nx, Nz)
+            surS23 = S23_pred.reshape(Ny, Nx, Nz)
+            surS31 = S31_pred.reshape(Ny, Nx, Nz)
+            surS32 = S32_pred.reshape(Ny, Nx, Nz)
+            surS33 = S33_pred.reshape(Ny, Nx, Nz)
+            SVonMises = np.float64(
+                np.sqrt(0.5 * ((surS11 - surS22) ** 2 + (surS22 - surS33) ** 2 + (surS33 - surS11) ** 2 + 6 * (
+                        surS12 ** 2 + surS23 ** 2 + surS31 ** 2))))
+            U = (np.float64(surUx), np.float64(surUy), np.float64(surUz))
+            S1 = (np.float64(surS11), np.float64(surS12), np.float64(surS13))
+            S2 = (np.float64(surS21), np.float64(surS22), np.float64(surS23))
+            S3 = (np.float64(surS31), np.float64(surS32), np.float64(surS33))
+            E1 = (np.float64(surE11), np.float64(surE12), np.float64(surE13))
+            E2 = (np.float64(surE21), np.float64(surE22), np.float64(surE23))
+            E3 = (np.float64(surE31), np.float64(surE32), np.float64(surE33))
+            return U, np.float64(surS11), np.float64(surS12), np.float64(surS13), np.float64(surS22), np.float64(surS23), \
+                   np.float64(surS33), np.float64(surE11), np.float64(surE12), \
+                   np.float64(surE13), np.float64(surE22), np.float64(surE23), np.float64(surE33), np.float64(SVonMises), \
+                   np.float64(F11_pred), np.float64(F12_pred), np.float64(F13_pred), \
+                   np.float64(F21_pred), np.float64(F22_pred), np.float64(F23_pred), \
+                   np.float64(F31_pred), np.float64(F32_pred), np.float64(F33_pred)
+    # --------------------------------------------------------------------------------
+    # method: loss sum for the energy part
+    # --------------------------------------------------------------------------------
+    @staticmethod
+    def loss_sum(tinput):
+        return torch.sum(tinput) / tinput.data.nelement()
+
+    # --------------------------------------------------------------------------------
+    # purpose: loss square sum for the boundary part
+    # --------------------------------------------------------------------------------
+    @staticmethod
+    def loss_squared_sum(tinput, target):
+        row, column = tinput.shape
+        loss = 0
+        for j in range(column):
+            loss += torch.sum((tinput[:, j] - target[:, j]) ** 2) / tinput[:, j].data.nelement()
+        return loss
+    
+### copied from Beam2D_4x1_NeoHook_Trap.py ###
+# changed from material model to CANN model
+
+if __name__ == '__main__':
+
+    # switch between original energy model and CANN model
+    #energy_model = 'original'
+    energy_model = 'CANN'
+    weights_manual = True
+
+    # ----------------------------------------------------------------------
+    #                   STEP 1: SETUP DOMAIN - COLLECT CLEAN DATABASE
+    # ----------------------------------------------------------------------
+    dom, boundary_neumann, boundary_dirichlet = des.setup_domain()
+    x, y, datatest = des.get_datatest()
+
+    ### Jonathan ###
+    # convert dom to tensor with requires_grad=True
+    dom = torch.from_numpy(dom).float()
+    dom = dom.to(device)
+    dom.requires_grad_(True)
+
+    ################
+
+    # ----------------------------------------------------------------------
+    #                   STEP 2: SETUP MODEL
+    # ----------------------------------------------------------------------
+
+    # get path of current file to use relative paths from there
+    path = Path(__file__).parent.parent.parent
+    weights_path = (path / 'CANN/weights/CANN_weights.pth').resolve()
+    model_path = (path / 'CANN/exports/CANN.pt').resolve()
+
+    if energy_model == 'original':
+        mat = md.EnergyModel('neohookean', 2, cf.E, cf.nu)
+        dem = DeepEnergyMethod([cf.D_in, cf.H, cf.D_out], 'trapezoidal', mat, 2)
+
+    elif energy_model == 'CANN':
+        # load CANN model
+        #CANN_model = torch.load(model_path)
+        CANN_model = CANN_2D()
+        # load existing weights
+
+        if weights_manual:
+            weights_hidden_layer2 = [torch.tensor([[0.0]]), torch.tensor([[0.0]]), torch.tensor([[0.0]]),\
+                                     torch.tensor([[0.0]]), torch.tensor([[0.0]]), torch.tensor([[0.0]])]  
+            weights_output_layer = torch.tensor([300.0, 0.0, 0.0, 0.0, 0.0, 0.0,\
+                                                 150.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+            # Assign the weights to the model's parameters
+            for i, weights in enumerate(weights_hidden_layer2):
+                CANN_model.hidden_layer2[i][0].weight.data = weights
+
+            CANN_model.output_layer.weight.data = weights_output_layer
+            
+        elif weights_path.exists():
+            CANN_model.load_state_dict(torch.load(weights_path))
+        else:
+            print('No weights found')
+
+    # ----------------------------------------------------------------------
+    #                   STEP 3: TRAINING MODEL
+    # ----------------------------------------------------------------------
+    start_time = time.time()
+    shape = [cf.Nx, cf.Ny]
+    dxdy = [cf.hx, cf.hy]
+    cf.iteration = 3000
+    cf.lr = 0.002
+    cf.filename_out = "./output/dem/NeoHook_3Layer_mesh40x10_iter30_trap"
+
+    dem = DeepEnergyMethod([cf.D_in, cf.H, cf.D_out], 'trapezoidal', CANN_model, 2, cf.lr ,model_type='CANN', optimizer=torchopt.MetaAdamW)
+    
+    ### Jonathan ###
+    if energy_model == 'CANN':
+        psi, F, saved_state = dem.train_model(shape, dxdy, dom, boundary_neumann, boundary_dirichlet,  cf.iteration)
+    ################
+
+    end_time = time.time() - start_time
+    print("End time: %.5f" % end_time)
+    z = np.array([0])
+    U, S11, S12, S13, S22, S23, S33, E11, E12, E13, E22, E23, E33, SVonMises, F11, F12, F21, F22, F, xy_tensor = dem.evaluate_model(x, y, z) # Jonathan added F
+
+    ########### Jonathan Plotting ##############
+
+    #u_dem = dem.model(torch.tensor(dom, dtype=torch.float32))
+    u_dem = dem.getU(dom)
+    loss_cann = (u_dem).mean()
+
+    # testwise compute gradients
+    #gradient_u_dem_x = torch.autograd.grad(loss_cann, dom)
+    #print(gradient_u_dem_x)
+
+    CANN_model = torch.load(r'C:\Users\johnn\tubCloud\Uni\Master\MA\Sourcecode\CANN\exports\CANN.pt')
+    CANN_model.eval()
+    Psi, P = CANN_model(F)
+
+    J = torch.det(F).detach()
+    P11 = P[:,0,0].detach()
+    P22 = P[:,1,1].detach()
+    P12 = P[:,0,1].detach()
+    P21 = P[:,1,0].detach()
+
+    sigma_xx = P11 / J
+    sigma_yy = P22 / J
+    tau_xy = P12 / J
+
+    sigma_vm = np.sqrt((sigma_xx - sigma_yy)**2 + 3*tau_xy**2)
+
+    sigma_vm = sigma_vm.reshape([len(x), len(y)])
+
+    X, Y = np.meshgrid(x, y)
+    plt.figure(figsize=(4, 2))
+    plt.scatter(X, Y, c=sigma_vm, s=1)
+    plt.axis('equal')
+    #plt.show(block=True)
+
+    # plot beam
+    #plot_beam(dom.detach().numpy(), u_dem.detach().numpy(), cf.Nx, cf.Ny)
+    #plot_beam(np.stack((X,Y),axis=2),np.stack((U[0],U[1]),axis=2).squeeze(), len(x), len(y))    
+
+
+    ############################################
