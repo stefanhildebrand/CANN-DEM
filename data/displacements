@@ -1,0 +1,71 @@
+from tkinter import font
+from DeepEnergyMethod.dem_hyperelasticity.Beam2D.Beam2D_4x1_NeoHook_Trap import DeepEnergyMethod
+from DeepEnergyMethod.dem_hyperelasticity.Beam2D import config as cf
+from DeepEnergyMethod.dem_hyperelasticity.Beam2D import define_structure as des
+from DeepEnergyMethod.dem_hyperelasticity import EnergyModel as md
+from DEM.visualization.plot_beam import plot_beam
+
+import numpy as np
+import time
+from pathlib import Path
+from matplotlib import pyplot as plt
+
+def simulate_displacement_dem(beam_traction_x=0, beam_traction_y=0, iterations=50):
+    ### copied from Beam2D_4x1_NeoHook_Trap.py ###
+
+    # ----------------------------------------------------------------------
+    #                   STEP 1: SETUP DOMAIN - COLLECT CLEAN DATABASE
+    # ----------------------------------------------------------------------
+    dom, boundary_neumann, boundary_dirichlet = des.setup_domain(traction_x=beam_traction_x, traction_y=beam_traction_y)
+    x, y, datatest = des.get_datatest()
+    # ----------------------------------------------------------------------
+    #                   STEP 2: SETUP MODEL
+    # ----------------------------------------------------------------------
+    mat = md.EnergyModel('neohookean', 2, cf.E, cf.nu)
+    dem = DeepEnergyMethod([cf.D_in, cf.H, cf.D_out], 'trapezoidal', mat, 2)
+    # ----------------------------------------------------------------------
+    #                   STEP 3: TRAINING MODEL
+    # ----------------------------------------------------------------------
+    start_time = time.time()
+    shape = [cf.Nx, cf.Ny]
+    dxdy = [cf.hx, cf.hy]
+    cf.iteration = iterations
+    cf.filename_out = "./output/dem/NeoHook_3Layer_mesh40x10_iter30_trap"
+    dem.train_model(shape, dxdy, dom, boundary_neumann, boundary_dirichlet,  cf.iteration, cf.lr)
+    end_time = time.time() - start_time
+    print("End time: %.5f" % end_time)
+    z = np.array([0])
+    U, S11, S12, S13, S22, S23, S33, E11, E12, E13, E22, E23, E33, SVonMises, F11, F12, F21, F22, F, xy_tensor = dem.evaluate_model(x, y, z)
+
+    u_pred = np.stack((U[0].flatten(), U[1].flatten()), axis=1)
+
+    return u_pred, xy_tensor
+
+# only execute when script is run directly
+if __name__ == '__main__':
+    beam_tx_list    = [0, 0, 0, 0, 0, 100, 300, 400, 500]
+    beam_ty_list    = [3, -8, 15, -25, 50, -50, 0, -100, 200]
+    iteration_list  = [80, 70, 70, 60, 55, 35, 30, 25, 20]
+
+    u_results = []
+
+    for beam_tx, beam_ty, iter in zip(beam_tx_list, beam_ty_list, iteration_list):
+        u, x = simulate_displacement_dem(beam_traction_x=beam_tx, beam_traction_y=beam_ty, iterations=iter)
+
+        u_results.append(u)
+
+        plot_beam(x.detach(), [u], cf.Nx, cf.Ny)
+        plt.show(block=True)
+
+    # get directory of this file
+    dir_path = Path(__file__).parent.absolute()
+
+    # save data
+    np.save(dir_path / 'u.npy', u_results)
+    print("saved u.npy")
+    np.save(dir_path / 'x.npy', x.detach())
+    print("saved x.npy")
+    np.save(dir_path / 'ty.npy', beam_ty_list)
+    print("saved ty.npy")
+    np.save(dir_path / 'tx.npy', beam_tx_list)
+    print("saved tx.npy")   
